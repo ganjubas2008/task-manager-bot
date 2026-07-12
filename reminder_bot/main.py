@@ -30,6 +30,7 @@ def build_application(settings: Settings):
         service=ReminderService(repository),
         transport=client,
         clock=clock,
+        daily_review_time=settings.daily_review_time,
     )
     return application, repository, client
 
@@ -55,7 +56,10 @@ def main() -> None:
                     finally:
                         offset = int(update["update_id"]) + 1
                         repository.set_state("telegram_offset", str(offset))
+                # Сначала обычные напоминания: задача, уже показанная сегодня,
+                # не должна тут же дублироваться в утренней проверке.
                 application.send_due_reminders()
+                application.send_daily_reviews()
             except TelegramAPIError as error:
                 print(f"Ошибка Telegram: {error}. Повтор через 3 секунды.")
                 time.sleep(3)

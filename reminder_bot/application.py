@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as clock_time, timedelta, timezone
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
@@ -14,7 +14,13 @@ from reminder_bot.constants import (
     PENDING_MANUAL_TEXT,
     PENDING_MANUAL_TIME,
 )
-from reminder_bot.domain import ClarificationType, ParseResult, PendingRequest, UnsupportedInput
+from reminder_bot.domain import (
+    ClarificationType,
+    ParseResult,
+    PendingRequest,
+    Reminder,
+    UnsupportedInput,
+)
 from reminder_bot.parsers.base import ReminderParser
 from reminder_bot.repository import Repository
 from reminder_bot.service import ReminderService
@@ -26,6 +32,9 @@ MAIN_KEYBOARD = {
     "resize_keyboard": True,
 }
 
+DAILY_REVIEW_LIMIT = 20
+DAILY_REVIEW_WINDOW = timedelta(hours=3)
+
 HELP_TEXT = """Я создаю напоминания из обычного текста.
 
 Примеры:
@@ -36,8 +45,10 @@ HELP_TEXT = """Я создаю напоминания из обычного те
 
 Если время неоднозначно, я обязательно уточню.
 Все даты и время — по Москве.
-Перед созданием задачи я попрошу подтверждение.
-Кнопка «Изменить» открывает ручное редактирование текста, даты и времени.
+Понятную задачу я создам сразу — её можно отменить или изменить кнопкой.
+В уведомлении можно отметить задачу сделанной или попросить напомнить позже.
+После уведомления задача останется активной, пока ты не отметишь её сделанной.
+Несделанные задачи повторяются каждый день в то же время, а утром приходят одним списком.
 Отмена текущего уточнения: /cancel"""
 
 
@@ -63,12 +74,14 @@ class BotApplication:
         service: ReminderService,
         transport: BotTransport,
         clock: Clock,
+        daily_review_time: clock_time = clock_time(8, 45),
     ):
         self.repository = repository
         self.parser = parser
         self.service = service
         self.transport = transport
         self.clock = clock
+        self.daily_review_time = daily_review_time
 
     def handle_update(self, update: dict) -> None:
         callback = update.get("callback_query")
@@ -146,7 +159,7 @@ class BotApplication:
         if result.needs_clarification:
             self._request_clarification(user_id, chat_id, text, result, now_utc)
             return
-        self._request_confirmation(user_id, chat_id, text, result, now_utc)
+        self._create_and_confirm(user_id, chat_id, text, result, now_utc)
 
     def _handle_callback(self, callback: dict) -> None:
         callback_id = callback["id"]
@@ -156,6 +169,224 @@ class BotApplication:
         message_id = message.get("message_id")
         data = callback.get("data", "")
         now_utc = self.clock.now_utc()
+
+        if data.startswith("created:"):
+            parts = data.split(":")
+            if len(parts) != 3 or parts[1] not in {"undo", "edit"}:
+                self.transport.answer_callback(callback_id, "Некорректная команда")
+                return
+            try:
+                reminder_id = int(parts[2])
+            except ValueError:
+                self.transport.answer_callback(callback_id, "Некорректная команда")
+                return
+            reminder = self.repository.find_active_reminder(reminder_id, user_id)
+            if reminder is None:
+                self.transport.answer_callback(callback_id, "Задача уже закрыта")
+                return
+
+            if parts[1] == "undo":
+                cancelled = self.repository.cancel_reminder(
+                    reminder_id,
+                    user_id,
+                    now_utc,
+                )
+                self.transport.answer_callback(
+                    callback_id,
+                    "Создание отменено" if cancelled else "Задача уже закрыта",
+                )
+                if cancelled:
+                    self._edit_or_send(
+                        chat_id,
+                        int(message_id) if message_id is not None else None,
+                        f"↩️ Отменено: {reminder.title}",
+                        {"inline_keyboard": []},
+                    )
+                return
+
+            pending = self._editing_pending_from_reminder(
+                reminder,
+                now_utc,
+                int(message_id) if message_id is not None else None,
+            )
+            self.repository.save_pending(pending)
+            self.transport.answer_callback(callback_id)
+            self._show_manual_menu(
+                pending,
+                message_id=int(message_id) if message_id is not None else None,
+            )
+            return
+
+        if data.startswith("snooze:"):
+            parts = data.split(":")
+            if len(parts) != 3 or parts[1] not in {
+                "menu",
+                "back",
+                "15",
+                "60",
+                "tomorrow",
+            }:
+                self.transport.answer_callback(callback_id, "Некорректная команда")
+                return
+            try:
+                reminder_id = int(parts[2])
+            except ValueError:
+                self.transport.answer_callback(callback_id, "Некорректная команда")
+                return
+            reminder = self.repository.find_active_reminder(reminder_id, user_id)
+            if reminder is None:
+                self.transport.answer_callback(callback_id, "Задача уже закрыта")
+                return
+
+            action = parts[1]
+            self.transport.answer_callback(callback_id)
+            effective_message_id = (
+                int(message_id) if message_id is not None else None
+            )
+            if action == "menu":
+                self._edit_or_send(
+                    chat_id,
+                    effective_message_id,
+                    f"⏰ {reminder.title}\n\nКогда напомнить снова?",
+                    self.service.snooze_keyboard(reminder),
+                )
+                return
+            if action == "back":
+                self._edit_or_send(
+                    chat_id,
+                    effective_message_id,
+                    self.service.format_notification(reminder),
+                    self.service.notification_keyboard(reminder),
+                )
+                return
+
+            target = self.service.snooze_target(reminder, action, now_utc)
+            snoozed = self.repository.snooze_reminder(
+                reminder_id,
+                user_id,
+                target,
+                now_utc,
+            )
+            if snoozed is None:
+                return
+            local_target = target.astimezone(ZoneInfo(reminder.user_timezone))
+            if action == "15":
+                when = f"через 15 минут, в {local_target:%H:%M}"
+            elif action == "60":
+                when = f"через час, в {local_target:%H:%M}"
+            else:
+                when = f"завтра в {local_target:%H:%M}"
+            self._edit_or_send(
+                chat_id,
+                effective_message_id,
+                f"⏰ Хорошо, напомню {when}.\n\n{reminder.title}",
+                {"inline_keyboard": []},
+            )
+            return
+
+        if data.startswith("task:"):
+            parts = data.split(":")
+            if len(parts) != 3 or parts[1] not in {
+                "completed",
+                "not_done",
+                "irrelevant",
+            }:
+                self.transport.answer_callback(callback_id, "Некорректная команда")
+                return
+            try:
+                reminder_id = int(parts[2])
+            except ValueError:
+                self.transport.answer_callback(callback_id, "Некорректная команда")
+                return
+
+            action = parts[1]
+            outcome = self.repository.respond_to_reminder(
+                reminder_id=reminder_id,
+                telegram_user_id=user_id,
+                action=action,
+                source="notification",
+                now=now_utc,
+            )
+            if outcome != "updated":
+                self.transport.answer_callback(callback_id, "Задача уже закрыта")
+                return
+
+            reminder = self.repository.get_reminder(reminder_id)
+            self.transport.answer_callback(
+                callback_id,
+                {
+                    "completed": "Готово — больше не напомню",
+                    "not_done": "Хорошо, напомню снова",
+                    "irrelevant": "Больше не напоминаю",
+                }[action],
+            )
+            self._show_task_response(
+                reminder,
+                action,
+                chat_id,
+                int(message_id) if message_id is not None else None,
+            )
+            return
+
+        if data.startswith("review:"):
+            parts = data.split(":")
+            if len(parts) != 4 or parts[1] not in {
+                "completed",
+                "not_done",
+                "irrelevant",
+            }:
+                self.transport.answer_callback(callback_id, "Некорректная команда")
+                return
+            action = parts[1]
+            try:
+                reminder_id = int(parts[2])
+                review_date = datetime.strptime(parts[3], "%Y%m%d").date().isoformat()
+            except ValueError:
+                self.transport.answer_callback(callback_id, "Некорректная команда")
+                return
+
+            review_item_updated = self.repository.mark_daily_review_response(
+                telegram_user_id=user_id,
+                chat_id=chat_id,
+                review_date=review_date,
+                reminder_id=reminder_id,
+                response=action,
+                now=now_utc,
+            )
+            if not review_item_updated:
+                self.transport.answer_callback(callback_id, "Этот ответ уже учтён")
+                if message_id is not None:
+                    self._refresh_daily_review_message(
+                        user_id,
+                        chat_id,
+                        review_date,
+                        int(message_id),
+                    )
+                return
+
+            outcome = self.repository.respond_to_reminder(
+                reminder_id=reminder_id,
+                telegram_user_id=user_id,
+                action=action,
+                source="daily_review",
+                now=now_utc,
+            )
+            callback_text = {
+                "completed": "Отмечено: сделано",
+                "not_done": "Отмечено: ещё не сделано",
+                "irrelevant": "Отмечено: неактуально",
+            }[action]
+            if outcome != "updated":
+                callback_text = "Задача уже закрыта"
+            self.transport.answer_callback(callback_id, callback_text)
+            if message_id is not None:
+                self._refresh_daily_review_message(
+                    user_id,
+                    chat_id,
+                    review_date,
+                    int(message_id),
+                )
+            return
 
         if data.startswith("delete:"):
             try:
@@ -237,9 +468,29 @@ class BotApplication:
 
             if action == "cancel":
                 self.repository.clear_pending(user_id)
+                if pending.reminder_id is not None:
+                    reminder = self.repository.find_active_reminder(
+                        pending.reminder_id,
+                        user_id,
+                    )
+                    if reminder is not None:
+                        self._edit_or_send(
+                            pending.chat_id,
+                            int(message_id) if message_id is not None else pending.message_id,
+                            self.service.format_confirmation(reminder),
+                            self.service.created_task_keyboard(reminder),
+                        )
+                    return
                 self._send(pending.chat_id, "❌ Задача отменена.")
                 return
             if action == "done":
+                if pending.reminder_id is not None:
+                    self._update_existing_reminder(
+                        pending,
+                        now_utc,
+                        int(message_id) if message_id is not None else pending.message_id,
+                    )
+                    return
                 self._request_confirmation(
                     user_id,
                     pending.chat_id,
@@ -422,7 +673,7 @@ class BotApplication:
 
         self._move_yearless_date_to_future(result, pending.source_text, local_now)
         self.repository.clear_pending(pending.telegram_user_id)
-        self._request_confirmation(
+        self._create_and_confirm(
             pending.telegram_user_id,
             pending.chat_id,
             pending.source_text,
@@ -491,6 +742,7 @@ class BotApplication:
             clarification_type=PENDING_MANUAL_MENU,
             created_at=now_utc,
             message_id=pending.message_id,
+            reminder_id=pending.reminder_id,
         )
         self.repository.save_pending(menu_pending)
         self._show_manual_menu(menu_pending, message_id=pending.message_id)
@@ -521,7 +773,10 @@ class BotApplication:
                 ],
                 [
                     {"text": "✅ Готово", "callback_data": "manual:done"},
-                    {"text": "❌ Отмена", "callback_data": "manual:cancel"},
+                    {
+                        "text": "↩️ Не менять" if pending.reminder_id else "❌ Отмена",
+                        "callback_data": "manual:cancel",
+                    },
                 ],
             ]
         }
@@ -543,6 +798,63 @@ class BotApplication:
             clarification_type=pending_type,
             created_at=now,
             message_id=message_id if message_id is not None else pending.message_id,
+            reminder_id=pending.reminder_id,
+        )
+
+    @staticmethod
+    def _editing_pending_from_reminder(
+        reminder: Reminder,
+        now: datetime,
+        message_id: int | None,
+    ) -> PendingRequest:
+        local = reminder.scheduled_at_utc.astimezone(ZoneInfo(MOSCOW_TIMEZONE))
+        return PendingRequest(
+            telegram_user_id=reminder.telegram_user_id,
+            chat_id=reminder.chat_id,
+            source_text=reminder.source_text,
+            parse_result=ParseResult(
+                title=reminder.title,
+                date=local.date().isoformat(),
+                time=local.strftime("%H:%M"),
+                date_was_explicit=True,
+                time_was_explicit=True,
+                parser_type=reminder.parser_type,
+            ),
+            clarification_type=PENDING_MANUAL_MENU,
+            created_at=now,
+            message_id=message_id,
+            reminder_id=reminder.id,
+        )
+
+    def _update_existing_reminder(
+        self,
+        pending: PendingRequest,
+        now: datetime,
+        message_id: int | None,
+    ) -> None:
+        if pending.reminder_id is None:
+            return
+        try:
+            reminder = self.service.update(
+                pending.reminder_id,
+                pending.telegram_user_id,
+                pending.source_text,
+                pending.parse_result,
+                now,
+            )
+        except ValidationError as error:
+            self._send(pending.chat_id, error.user_message)
+            return
+        if reminder is None:
+            self.repository.clear_pending(pending.telegram_user_id)
+            self._send(pending.chat_id, "Эта задача уже закрыта.")
+            return
+        self.repository.clear_pending(pending.telegram_user_id)
+        self._edit_or_send(
+            pending.chat_id,
+            message_id,
+            self.service.format_confirmation(reminder),
+            self.service.created_task_keyboard(reminder),
         )
 
     def _edit_or_send(
@@ -617,7 +929,11 @@ class BotApplication:
         except ValidationError as error:
             self._send(chat_id, error.user_message)
             return
-        self._send(chat_id, self.service.format_confirmation(reminder))
+        self.transport.send_message(
+            chat_id,
+            self.service.format_confirmation(reminder),
+            reply_markup=self.service.created_task_keyboard(reminder),
+        )
 
     def _show_reminders(self, user_id: int, chat_id: int) -> None:
         reminders = self.repository.list_active(user_id)
@@ -647,16 +963,137 @@ class BotApplication:
             reply_markup=markup,
         )
 
+    def _show_task_response(
+        self,
+        reminder: Reminder,
+        action: str,
+        chat_id: int,
+        message_id: int | None,
+    ) -> None:
+        if action == "completed":
+            text = f"✅ Сделано: {reminder.title}"
+        elif action == "irrelevant":
+            text = f"🚫 Больше не напоминаю: {reminder.title}"
+        else:
+            local_next = reminder.scheduled_at_utc.astimezone(
+                ZoneInfo(reminder.user_timezone)
+            )
+            text = (
+                f"⏳ Пока не сделано: {reminder.title}\n\n"
+                f"Напомню снова {local_next:%d.%m в %H:%M} (МСК)."
+            )
+        markup = {"inline_keyboard": []}
+        if message_id is None:
+            self.transport.send_message(chat_id, text, reply_markup=markup)
+            return
+        try:
+            self.transport.edit_message_text(
+                chat_id,
+                message_id,
+                text,
+                reply_markup=markup,
+            )
+        except RuntimeError:
+            # Ответ уже записан; не возвращаем кнопку из-за сбоя редактирования.
+            return
+
+    def _refresh_daily_review_message(
+        self,
+        user_id: int,
+        chat_id: int,
+        review_date: str,
+        message_id: int,
+    ) -> None:
+        reminders = self.repository.list_open_daily_review_items(
+            user_id,
+            chat_id,
+            review_date,
+        )
+        if reminders:
+            text = self.service.format_daily_review(reminders)
+            markup = self.service.daily_review_keyboard(reminders, review_date)
+        else:
+            text = "✅ Всё разобрано. Хорошего дня!"
+            markup = {"inline_keyboard": []}
+        try:
+            self.transport.edit_message_text(
+                chat_id,
+                message_id,
+                text,
+                reply_markup=markup,
+            )
+        except RuntimeError:
+            # Состояние задач уже сохранено; устаревшее сообщение не должно ломать update.
+            return
+
     def send_due_reminders(self) -> int:
         now = self.clock.now_utc()
         sent = 0
         for reminder in self.repository.due_reminders(now):
             try:
-                self.transport.send_message(reminder.chat_id, f"⏰ {reminder.title}")
+                self.transport.send_message(
+                    reminder.chat_id,
+                    self.service.format_notification(reminder),
+                    reply_markup=self.service.notification_keyboard(reminder),
+                )
             except RuntimeError:
                 # Оставляем active: следующая итерация повторит доставку.
                 continue
-            if self.repository.delete_after_delivery(reminder.id):
+            next_scheduled_at = self.service.next_daily_delivery(reminder, now)
+            if self.repository.mark_delivered(
+                reminder.id,
+                delivered_at=now,
+                next_scheduled_at=next_scheduled_at,
+            ):
+                sent += 1
+        return sent
+
+    def send_daily_reviews(self) -> int:
+        now = self.clock.now_utc()
+        zone = ZoneInfo(MOSCOW_TIMEZONE)
+        local_now = now.astimezone(zone)
+        review_starts = datetime.combine(
+            local_now.date(),
+            self.daily_review_time,
+            tzinfo=zone,
+        )
+        if not review_starts <= local_now < review_starts + DAILY_REVIEW_WINDOW:
+            return 0
+
+        day_started = datetime.combine(
+            local_now.date(),
+            clock_time.min,
+            tzinfo=zone,
+        ).astimezone(timezone.utc)
+        review_date = local_now.date().isoformat()
+        candidates = self.repository.list_daily_review_candidates(day_started, now)
+        grouped: dict[tuple[int, int], list[Reminder]] = {}
+        for reminder in candidates:
+            grouped.setdefault(
+                (reminder.telegram_user_id, reminder.chat_id),
+                [],
+            ).append(reminder)
+
+        sent = 0
+        for (user_id, chat_id), reminders in grouped.items():
+            if self.repository.daily_review_was_sent(user_id, chat_id, review_date):
+                continue
+            batch = reminders[:DAILY_REVIEW_LIMIT]
+            try:
+                self.transport.send_message(
+                    chat_id,
+                    self.service.format_daily_review(batch),
+                    reply_markup=self.service.daily_review_keyboard(batch, review_date),
+                )
+            except RuntimeError:
+                continue
+            if self.repository.save_daily_review(
+                user_id,
+                chat_id,
+                review_date,
+                [reminder.id for reminder in batch],
+                sent_at=now,
+            ):
                 sent += 1
         return sent
 

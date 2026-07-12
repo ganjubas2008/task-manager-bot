@@ -7,7 +7,6 @@ from reminder_bot.application import BotApplication
 from reminder_bot.clock import FixedClock
 from reminder_bot.constants import (
     MOSCOW_TIMEZONE,
-    PENDING_CONFIRMATION,
     PENDING_MANUAL_DATE,
     PENDING_MANUAL_MENU,
     PENDING_MANUAL_TEXT,
@@ -103,12 +102,8 @@ class ApplicationTests(unittest.TestCase):
     def submit(self, text="концерт завтра в 19:00", update_id=1):
         self.app.handle_update(message_update(text, update_id=update_id))
 
-    def confirm(self, action="yes", update_id=2):
-        self.app.handle_update(callback_update(f"confirm:{action}", update_id=update_id))
-
     def create_confirmed(self, text="концерт завтра в 19:00"):
         self.submit(text)
-        self.confirm("yes")
         return self.repository.list_active(1)[0]
 
     def test_first_run_uses_moscow_without_onboarding_or_timezone_button(self):
@@ -122,24 +117,22 @@ class ApplicationTests(unittest.TestCase):
         self.app.handle_update(message_update("/timezone", update_id=2))
         self.assertEqual("Часовой пояс фиксирован: МСК.", self.transport.messages[-1]["text"])
 
-    def test_task_is_not_created_before_yes(self):
+    def test_clear_task_is_created_immediately_with_undo_and_edit(self):
         self.submit()
-        self.assertEqual([], self.repository.list_active(1))
-        pending = self.repository.get_pending(1)
-        self.assertEqual(PENDING_CONFIRMATION, pending.clarification_type)
+        reminder = self.repository.list_active(1)[0]
+        self.assertIsNone(self.repository.get_pending(1))
         self.assertEqual(
-            "Создать задачу: Концерт\nСрок: 13.07.2026 19:00 (МСК)",
+            "✅ Задача создана: Концерт\nСрок: 13.07.2026 19:00 (МСК)",
             self.transport.messages[-1]["text"],
         )
         keyboard = self.transport.messages[-1]["reply_markup"]["inline_keyboard"][0]
         self.assertEqual(
-            ["confirm:yes", "confirm:no", "confirm:edit"],
+            [f"created:undo:{reminder.id}", f"created:edit:{reminder.id}"],
             [button["callback_data"] for button in keyboard],
         )
 
-    def test_yes_creates_task_with_requested_message_format(self):
+    def test_automatic_creation_uses_requested_message_format(self):
         self.submit("смотреть видео на итальянском завтра в 19:20")
-        self.confirm("yes")
         reminders = self.repository.list_active(1)
         self.assertEqual(1, len(reminders))
         self.assertEqual(MOSCOW_TIMEZONE, reminders[0].user_timezone)
@@ -150,18 +143,26 @@ class ApplicationTests(unittest.TestCase):
         )
         self.assertIsNone(self.repository.get_pending(1))
 
-    def test_no_cancels_without_creating_task(self):
+    def test_undo_removes_automatically_created_task(self):
         self.submit()
-        self.confirm("no")
+        reminder = self.repository.list_active(1)[0]
+        self.app.handle_update(
+            callback_update(f"created:undo:{reminder.id}", update_id=2)
+        )
         self.assertEqual([], self.repository.list_active(1))
         self.assertIsNone(self.repository.get_pending(1))
-        self.assertEqual("❌ Задача отменена.", self.transport.messages[-1]["text"])
+        self.assertEqual("↩️ Отменено: Концерт", self.transport.edits[-1]["text"])
+        self.assertEqual("Создание отменено", self.transport.callbacks[-1][1])
 
     def test_manual_edit_changes_fields_separately_without_parsers(self):
         self.submit("концерт завтра в 19:00", update_id=1)
         self.assertEqual(1, self.parser.calls)
-        self.confirm("edit", update_id=2)
+        reminder = self.repository.list_active(1)[0]
+        self.app.handle_update(
+            callback_update(f"created:edit:{reminder.id}", update_id=2)
+        )
         self.assertEqual(PENDING_MANUAL_MENU, self.repository.get_pending(1).clarification_type)
+        self.assertEqual(reminder.id, self.repository.get_pending(1).reminder_id)
         self.assertIn("✏️ Ручное редактирование", self.transport.edits[-1]["text"])
         callbacks = [
             button["callback_data"]
@@ -190,20 +191,22 @@ class ApplicationTests(unittest.TestCase):
         self.assertIn("Время: 07:05 (МСК)", self.transport.edits[-1]["text"])
 
         self.app.handle_update(callback_update("manual:done", update_id=9))
-        self.assertEqual(PENDING_CONFIRMATION, self.repository.get_pending(1).clarification_type)
+        self.assertIsNone(self.repository.get_pending(1))
         self.assertIn(
-            "Создать задачу: Смотреть видео на итальянском\n"
+            "✅ Задача создана: Смотреть видео на итальянском\n"
             "Срок: 25.07.2026 07:05 (МСК)",
             self.transport.edits[-1]["text"],
         )
-        self.confirm("yes", update_id=10)
         reminder = self.repository.list_active(1)[0]
         self.assertEqual("Смотреть видео на итальянском", reminder.title)
         self.assertEqual(1, self.parser.calls)
 
     def test_manual_date_and_time_require_exact_valid_formats(self):
         self.submit()
-        self.confirm("edit", update_id=2)
+        reminder = self.repository.list_active(1)[0]
+        self.app.handle_update(
+            callback_update(f"created:edit:{reminder.id}", update_id=2)
+        )
         self.app.handle_update(callback_update("manual:date", update_id=3))
         self.submit("31.02.2027", update_id=4)
         self.assertEqual(PENDING_MANUAL_DATE, self.repository.get_pending(1).clarification_type)
@@ -217,34 +220,48 @@ class ApplicationTests(unittest.TestCase):
         self.submit("19:00", update_id=8)
         self.assertEqual(PENDING_MANUAL_MENU, self.repository.get_pending(1).clarification_type)
 
-    def test_ambiguous_time_is_clarified_then_confirmed(self):
+    def test_cancel_edit_keeps_the_automatically_created_task_unchanged(self):
+        self.submit("концерт завтра в 19:00")
+        reminder = self.repository.list_active(1)[0]
+        self.app.handle_update(
+            callback_update(f"created:edit:{reminder.id}", update_id=2)
+        )
+        self.app.handle_update(callback_update("manual:text", update_id=3))
+        self.submit("Совсем другой текст", update_id=4)
+        self.app.handle_update(callback_update("manual:cancel", update_id=5))
+
+        unchanged = self.repository.get_reminder(reminder.id)
+        self.assertEqual("Концерт", unchanged.title)
+        self.assertIsNone(self.repository.get_pending(1))
+        self.assertEqual(
+            f"created:edit:{reminder.id}",
+            self.transport.edits[-1]["reply_markup"]["inline_keyboard"][0][1][
+                "callback_data"
+            ],
+        )
+
+    def test_ambiguous_time_is_clarified_then_created_automatically(self):
         self.submit("снять стирку 15/07 в 6:35")
         self.assertEqual([], self.repository.list_active(1))
         keyboard = self.transport.messages[-1]["reply_markup"]
         self.assertEqual("time:06:35", keyboard["inline_keyboard"][0][0]["callback_data"])
 
         self.app.handle_update(callback_update("time:18:35", update_id=2))
-        self.assertEqual([], self.repository.list_active(1))
-        self.assertEqual(PENDING_CONFIRMATION, self.repository.get_pending(1).clarification_type)
+        self.assertEqual(1, len(self.repository.list_active(1)))
+        self.assertIsNone(self.repository.get_pending(1))
         self.assertIn("Срок: 15.07.2026 18:35 (МСК)", self.transport.messages[-1]["text"])
 
-        self.confirm("yes", update_id=3)
-        self.assertEqual(1, len(self.repository.list_active(1)))
-
-    def test_missing_time_is_clarified_then_confirmed(self):
+    def test_missing_time_is_clarified_then_created_automatically(self):
         self.submit("завтра позвонить врачу")
         self.assertEqual("Во сколько?", self.transport.messages[-1]["text"])
         self.submit("19:00", update_id=2)
-        self.assertEqual([], self.repository.list_active(1))
-        self.assertIn("Создать задачу: Позвонить врачу", self.transport.messages[-1]["text"])
-        self.confirm("yes", update_id=3)
+        self.assertIn("✅ Задача создана: Позвонить врачу", self.transport.messages[-1]["text"])
         self.assertEqual("Позвонить врачу", self.repository.list_active(1)[0].title)
 
-    def test_yearless_date_rolls_forward_before_confirmation(self):
+    def test_yearless_date_rolls_forward_before_automatic_creation(self):
         self.submit("12/07 позвонить врачу")
         self.submit("14:00", update_id=2)
         self.assertIn("12.07.2027 14:00", self.transport.messages[-1]["text"])
-        self.confirm("yes", update_id=3)
         self.assertEqual(2027, self.repository.list_active(1)[0].scheduled_at_utc.year)
 
     def test_cancel_clears_any_pending_request(self):
@@ -276,7 +293,7 @@ class ApplicationTests(unittest.TestCase):
         self.assertIsNone(self.repository.get_pending(1))
         self.assertIn("не существует", self.transport.messages[-1]["text"])
 
-    def test_scheduler_sends_and_physically_deletes_reminder(self):
+    def test_scheduler_sends_first_notification_and_reschedules_for_tomorrow(self):
         reminder = self.repository.create_reminder(
             1,
             100,
@@ -289,9 +306,238 @@ class ApplicationTests(unittest.TestCase):
         )
         sent = self.app.send_due_reminders()
         self.assertEqual(1, sent)
-        self.assertEqual("⏰ Проверить сервер", self.transport.messages[-1]["text"])
-        with self.assertRaises(KeyError):
-            self.repository.get_reminder(reminder.id)
+        message = self.transport.messages[-1]
+        self.assertEqual(
+            "⏰ Проверить сервер\n\nЕсли уже сделал — отметь одним нажатием.",
+            message["text"],
+        )
+        self.assertEqual(
+            [[
+                {
+                    "text": "✅ Сделано",
+                    "callback_data": f"task:completed:{reminder.id}",
+                },
+                {
+                    "text": "⏰ Позже",
+                    "callback_data": f"snooze:menu:{reminder.id}",
+                },
+            ]],
+            message["reply_markup"]["inline_keyboard"],
+        )
+        stored = self.repository.get_reminder(reminder.id)
+        self.assertEqual("active", stored.status)
+        self.assertEqual(1, stored.notification_count)
+        self.assertGreater(stored.scheduled_at_utc, self.clock.now_utc())
+
+    def test_completion_button_closes_task_and_records_completion(self):
+        reminder = self.repository.create_reminder(
+            1,
+            100,
+            "Позвонить маме",
+            "исходный текст",
+            self.clock.now_utc() - timedelta(seconds=1),
+            MOSCOW_TIMEZONE,
+            "test",
+            self.clock.now_utc(),
+        )
+        self.app.send_due_reminders()
+        self.app.handle_update(
+            callback_update(f"task:completed:{reminder.id}", update_id=2)
+        )
+        completed = self.repository.get_reminder(reminder.id)
+        self.assertEqual("completed", completed.status)
+        self.assertEqual([], self.repository.list_active(1))
+        self.assertEqual("✅ Сделано: Позвонить маме", self.transport.edits[-1]["text"])
+        self.assertEqual(
+            [("completed", "notification")],
+            [
+                (event.action, event.source)
+                for event in self.repository.list_events(reminder.id)
+            ],
+        )
+
+    def test_repeated_notification_offers_done_later_and_irrelevant(self):
+        reminder = self.repository.create_reminder(
+            1,
+            100,
+            "Проверить сервер",
+            "исходный текст",
+            self.clock.now_utc() - timedelta(seconds=1),
+            MOSCOW_TIMEZONE,
+            "test",
+            self.clock.now_utc(),
+        )
+        self.app.send_due_reminders()
+        next_delivery = self.repository.get_reminder(reminder.id).scheduled_at_utc
+        self.clock.value = next_delivery + timedelta(seconds=1)
+        self.app.send_due_reminders()
+
+        message = self.transport.messages[-1]
+        self.assertEqual(
+            "⏰ Проверить сервер\n\nКак дела с этой задачей?",
+            message["text"],
+        )
+        callbacks = [
+            button["callback_data"]
+            for row in message["reply_markup"]["inline_keyboard"]
+            for button in row
+        ]
+        self.assertEqual(
+            [
+                f"task:completed:{reminder.id}",
+                f"snooze:menu:{reminder.id}",
+                f"task:irrelevant:{reminder.id}",
+            ],
+            callbacks,
+        )
+
+    def test_later_reveals_snooze_choices_and_preserves_daily_time(self):
+        original_due = self.clock.now_utc() - timedelta(seconds=1)
+        reminder = self.repository.create_reminder(
+            1,
+            100,
+            "Позвонить маме",
+            "исходный текст",
+            original_due,
+            MOSCOW_TIMEZONE,
+            "test",
+            self.clock.now_utc(),
+        )
+        self.app.send_due_reminders()
+        self.app.handle_update(
+            callback_update(f"snooze:menu:{reminder.id}", update_id=2)
+        )
+        menu = self.transport.edits[-1]
+        self.assertIn("Когда напомнить снова?", menu["text"])
+        callbacks = [
+            button["callback_data"]
+            for row in menu["reply_markup"]["inline_keyboard"]
+            for button in row
+        ]
+        self.assertEqual(
+            [
+                f"snooze:15:{reminder.id}",
+                f"snooze:60:{reminder.id}",
+                f"snooze:tomorrow:{reminder.id}",
+                f"snooze:back:{reminder.id}",
+            ],
+            callbacks,
+        )
+
+        self.app.handle_update(
+            callback_update(f"snooze:15:{reminder.id}", update_id=3)
+        )
+        snoozed = self.repository.get_reminder(reminder.id)
+        self.assertEqual(
+            self.clock.now_utc() + timedelta(minutes=15),
+            snoozed.scheduled_at_utc,
+        )
+        self.assertIn("через 15 минут", self.transport.edits[-1]["text"])
+
+        self.clock.value = snoozed.scheduled_at_utc + timedelta(seconds=1)
+        self.app.send_due_reminders()
+        rescheduled = self.repository.get_reminder(reminder.id)
+        self.assertEqual(
+            original_due + timedelta(days=1),
+            rescheduled.scheduled_at_utc,
+        )
+
+    def test_irrelevant_button_stops_future_notifications(self):
+        reminder = self.repository.create_reminder(
+            1,
+            100,
+            "Купить старый билет",
+            "исходный текст",
+            self.clock.now_utc() - timedelta(seconds=1),
+            MOSCOW_TIMEZONE,
+            "test",
+            self.clock.now_utc(),
+        )
+        self.app.send_due_reminders()
+        self.app.handle_update(
+            callback_update(f"task:irrelevant:{reminder.id}", update_id=2)
+        )
+        self.assertEqual("cancelled", self.repository.get_reminder(reminder.id).status)
+        self.assertEqual([], self.repository.due_reminders(self.clock.now_utc() + timedelta(days=7)))
+        self.assertEqual(
+            "🚫 Больше не напоминаю: Купить старый билет",
+            self.transport.edits[-1]["text"],
+        )
+
+    def test_daily_review_packs_yesterdays_tasks_and_updates_in_place(self):
+        delivered_at = datetime(2026, 7, 12, 5, 0, tzinfo=timezone.utc)
+        next_delivery = datetime(2026, 7, 13, 9, 0, tzinfo=timezone.utc)
+        reminders = []
+        for title in ["Позвонить маме", "Записаться к врачу"]:
+            reminder = self.repository.create_reminder(
+                1,
+                100,
+                title,
+                title,
+                delivered_at,
+                MOSCOW_TIMEZONE,
+                "test",
+                delivered_at,
+            )
+            self.repository.mark_delivered(
+                reminder.id,
+                delivered_at=delivered_at,
+                next_scheduled_at=next_delivery,
+            )
+            reminders.append(reminder)
+
+        # 05:45 UTC = 08:45 МСК on the next day.
+        self.clock.value = datetime(2026, 7, 13, 5, 45, tzinfo=timezone.utc)
+        self.assertEqual(1, self.app.send_daily_reviews())
+        review = self.transport.messages[-1]
+        self.assertIn("1. Позвонить маме", review["text"])
+        self.assertIn("2. Записаться к врачу", review["text"])
+        self.assertEqual(2, len(review["reply_markup"]["inline_keyboard"]))
+        self.assertEqual(0, self.app.send_daily_reviews())
+
+        review_date = "20260713"
+        self.app.handle_update(
+            callback_update(
+                f"review:not_done:{reminders[0].id}:{review_date}",
+                update_id=3,
+            )
+        )
+        self.assertEqual("active", self.repository.get_reminder(reminders[0].id).status)
+        self.assertNotIn("Позвонить маме", self.transport.edits[-1]["text"])
+        self.assertIn("Записаться к врачу", self.transport.edits[-1]["text"])
+
+        self.app.handle_update(
+            callback_update(
+                f"review:completed:{reminders[1].id}:{review_date}",
+                update_id=4,
+            )
+        )
+        self.assertEqual("completed", self.repository.get_reminder(reminders[1].id).status)
+        self.assertEqual("✅ Всё разобрано. Хорошего дня!", self.transport.edits[-1]["text"])
+        self.assertEqual(
+            ["not_done"],
+            [event.action for event in self.repository.list_events(reminders[0].id)],
+        )
+
+    def test_daily_review_is_sent_only_in_the_morning_window(self):
+        reminder = self.repository.create_reminder(
+            1,
+            100,
+            "Старая задача",
+            "текст",
+            datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc),
+            MOSCOW_TIMEZONE,
+            "test",
+            datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc),
+        )
+        self.repository.mark_delivered(
+            reminder.id,
+            datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc),
+            datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc),
+        )
+        # 15:00 МСК: a late restart must not produce a "good morning" message.
+        self.clock.value = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(0, self.app.send_daily_reviews())
 
     def test_scheduler_keeps_reminder_when_delivery_fails(self):
         reminder = self.repository.create_reminder(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime, time
 from pathlib import Path
 
 
@@ -29,6 +30,7 @@ class Settings:
     openai_model: str
     database_path: Path
     poll_timeout: int = 20
+    daily_review_time: time = time(8, 45)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -49,10 +51,19 @@ class Settings:
         if not database_path.is_absolute():
             database_path = project_root / database_path
 
+        review_time_value = os.getenv("DAILY_REVIEW_TIME", "08:45").strip()
+        try:
+            daily_review_time = datetime.strptime(review_time_value, "%H:%M").time()
+        except ValueError as error:
+            raise RuntimeError(
+                "DAILY_REVIEW_TIME должен быть в формате ЧЧ:ММ"
+            ) from error
+
         return cls(
             telegram_token=telegram_token,
             openai_api_key=openai_key,
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip(),
             database_path=database_path,
             poll_timeout=int(os.getenv("POLL_TIMEOUT", "20")),
+            daily_review_time=daily_review_time,
         )
